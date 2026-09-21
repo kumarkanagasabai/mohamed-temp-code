@@ -474,7 +474,7 @@ stages:
           destDir="$TARGET_DIR/"
           ubuntuDir="$WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/dockerfiles/debian/"
           arm64Dir="$WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/dockerfiles/debian-arm64/"
-          manifestDir="$WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/dockerfiles/mainfest/"
+          manifestDir="$WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/dockerfiles/manifest/"
           ls "$manifestDir"*.txt
           for txtFile in "$arm64Dir"*.txt; do
             [ -f "$txtFile" ] || continue
