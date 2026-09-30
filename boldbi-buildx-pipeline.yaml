@@ -265,6 +265,9 @@ stages:
         cd BoldBIServer-Linux
 
         wget https://raw.githubusercontent.com/mohamedasme-sf4303/temp-code/refs/heads/main/boldbi-manifets.txt
+        rm entrypoint.sh
+        wget https://raw.githubusercontent.com/mohamedasme-sf4303/temp-code/refs/heads/main/entrypoint.sh
+        ls
 
       displayName: Download Package
 
