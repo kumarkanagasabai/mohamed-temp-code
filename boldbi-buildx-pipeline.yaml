@@ -25,6 +25,15 @@ parameters:
     - dev
     - production
 
+# - name: images_type
+#   displayName: images_type
+#   type: string
+#   default: dev
+#   values:
+#     - debian
+#     - eval
+
+
 stages:
 
 - stage: Build
@@ -335,14 +344,22 @@ stages:
 
         docker buildx inspect --bootstrap
 
-        IMAGE="$(REPOSITORY):${{ parameters.imageTag }}_$(Build.BuildId)"
-
+        DEBIAN_IMAGE="$(REPOSITORY):${{ parameters.imageTag }}_$(Build.BuildId)"
+        EVAL_IMAGE="$(REPOSITORY):${{ parameters.imageTag }}_$(Build.BuildId)_eval"
         cd BoldBIServer-Linux
 
         docker buildx build \
           --builder boldbi-builder \
           --platform linux/amd64,linux/arm64 \
-          -t "$IMAGE" \
+          -t "$DEBIAN_IMAGE" \
+          -f boldbi-manifets.txt \
+          --push .
+
+        docker buildx build \
+          --builder boldbi-builder \
+          --platform linux/amd64,linux/arm64 \
+          -t "$EVAL_IMAGE" \
+          --build-arg INSTALL_POSTGRES=true \
           -f boldbi-manifets.txt \
           --push .
 
