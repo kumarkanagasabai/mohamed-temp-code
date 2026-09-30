@@ -1,44 +1,55 @@
 trigger: none
 
+variables:
+  ADO_ORG_URL: https://dev.azure.com/bold-bi
+  ADO_PROJECT: build
+  VARIABLE_GROUP_ID: 70
+
 parameters:
 
-  - name: imageTag
-    displayName: Docker Image Tag
-    type: string
-    default: latest
+- name: imageTag
+  displayName: Docker Image Tag
+  type: string
+  default: latest
 
-  - name: boldbiPackage
-    displayName: BoldBI Package
-    type: string
-    default: https://s3.amazonaws.com/files2.syncfusion.com/Installs/BoldBI/07-08-2026/BoldBIServer_Linux_Docker_16.2.5_08072026_091439.zip
+- name: boldbiPackage
+  displayName: BoldBI Package
+  type: string
+  default: https://s3.amazonaws.com/files2.syncfusion.com/Installs/BoldBI/07-08-2026/BoldBIServer_Linux_Docker_16.2.5_08072026_091439.zip
 
-  - name: buildType
-    displayName: Build Type
-    type: string
-    default: cloud
-    values:
-      - cloud
-      - selfhost
+- name: environment
+  displayName: Environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - production
 
-  - name: environment
-    displayName: Environment
-    type: string
-    default: dev
-    values:
-      - dev
-      - production
-
-variables:
-  VM_NAME: test-vm-$(Build.BuildId)
+- name: imagesType
+  displayName: Images Type
+  type: string
+  default: eval
+  values:
+    - debian
+    - eval
+    - both
 
 stages:
 
 - stage: Build
+
   jobs:
 
-  - job: DockerBuild
+  ####################################################################
+  # ARM64 JOB
+  ####################################################################
+
+  - job: Arm64Job
+
+    displayName: ARM64 IP + Wait For Image
+
     pool:
-      name: boldbi-sefl-host-amd64-vmss
+      name: boldbi-buildx-arm64-vmss-agent-pool
 
     steps:
 
@@ -47,7 +58,8 @@ stages:
     #################################################
 
     - bash: |
-        TAG="${{ parameters.imageTag }}"
+
+        TAG="${{ parameters.imageTag }}_$(Build.BuildId)"
 
         if [[ ! "$TAG" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ ]]; then
           echo "Invalid Docker image tag: $TAG"
@@ -55,7 +67,199 @@ stages:
         fi
 
         echo "Image tag validation successful"
-      displayName: Validate image tag
+
+      displayName: Validate Tag
+
+    #################################################
+    # Save ARM64 IP
+    #################################################
+
+    - bash: |
+
+        ARM64_IP=$(hostname -I | awk '{print $1}')
+
+        if [ -z "$ARM64_IP" ]; then
+          echo "ARM64 IP not found"
+          exit 1
+        fi
+
+        VAR_NAME="ARM64_IP_$(Build.BuildId)"
+
+        echo "Saving Variable: $VAR_NAME"
+        echo "ARM64 IP: $ARM64_IP"
+
+        az extension add --name azure-devops --yes
+
+        az pipelines variable-group variable create \
+        --organization "$(ADO_ORG_URL)" \
+        --project "$(ADO_PROJECT)" \
+        --group-id $(VARIABLE_GROUP_ID) \
+        --name "$VAR_NAME" \
+        --value "$ARM64_IP"
+        echo "ARM64 IP stored"
+
+      env:
+        AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+      displayName: Save ARM64 IP
+
+    #################################################
+    # Verify Multi-Arch Images
+    #################################################
+
+    - bash: |
+
+        if [ "${{ parameters.environment }}" = "dev" ]; then
+          REPO="syncfusion/dev-boldbi-docker"
+        else
+          REPO="syncfusion/boldbi"
+        fi
+
+        TAG="${{ parameters.imageTag }}_$(Build.BuildId)"
+        IMAGES_TYPE="${{ parameters.imagesType }}"
+
+        echo "$(DOCKER_PASSWORD)" | docker login \
+          -u "$(DOCKER_USERNAME)" \
+          --password-stdin
+
+        check_image() {
+
+          local IMAGE="$1"
+          local LABEL="$2"
+
+          for i in {1..30}
+          do
+
+            echo "[$LABEL] Attempt $i/30 : $IMAGE"
+
+            OUTPUT=$(docker buildx imagetools inspect "$IMAGE" 2>/dev/null)
+
+            AMD64_FOUND=$(echo "$OUTPUT" | grep -c "linux/amd64")
+            ARM64_FOUND=$(echo "$OUTPUT" | grep -c "linux/arm64")
+
+            echo "[$LABEL] amd64 count : $AMD64_FOUND"
+            echo "[$LABEL] arm64 count : $ARM64_FOUND"
+
+            if [ "$AMD64_FOUND" -gt 0 ] && [ "$ARM64_FOUND" -gt 0 ]; then
+              echo "[$LABEL] SUCCESS: Multi-Arch Image Found : $IMAGE"
+              return 0
+            fi
+
+            echo "[$LABEL] Required architectures not available yet..."
+            sleep 60
+
+          done
+
+          echo "[$LABEL] ERROR: Multi-Arch Image Not Found : $IMAGE"
+          return 1
+
+        }
+
+        echo "================================="
+        echo "Images Type : $IMAGES_TYPE"
+        echo "Waiting for images:"
+        if [ "$IMAGES_TYPE" = "debian" ] || [ "$IMAGES_TYPE" = "both" ]; then
+          echo " - ${REPO}:${TAG}"
+        fi
+        if [ "$IMAGES_TYPE" = "eval" ] || [ "$IMAGES_TYPE" = "both" ]; then
+          echo " - ${REPO}:${TAG}_eval"
+        fi
+        echo "Checking architectures:"
+        echo " - linux/amd64"
+        echo " - linux/arm64"
+        echo "================================="
+
+        if [ "$IMAGES_TYPE" = "debian" ] || [ "$IMAGES_TYPE" = "both" ]; then
+          check_image "${REPO}:${TAG}" "DEBIAN" || exit 1
+        fi
+
+        if [ "$IMAGES_TYPE" = "eval" ] || [ "$IMAGES_TYPE" = "both" ]; then
+          check_image "${REPO}:${TAG}_eval" "EVAL" || exit 1
+        fi
+
+        echo ""
+        echo "================================="
+        echo "SUCCESS: Requested Multi-Arch Image(s) Found"
+        echo "================================="
+
+      displayName: Wait For Images
+
+  ####################################################################
+  # AMD64 JOB
+  ####################################################################
+
+  - job: DockerBuild
+
+    displayName: Build Docker Image
+
+    pool:
+      name: boldbi-buildx-amd64-vmss-agent-pool
+
+    steps:
+
+    #################################################
+    # Wait for ARM64 IP
+    #################################################
+
+    - bash: |
+
+        VAR_NAME="ARM64_IP_$(Build.BuildId)"
+        az devops configure \
+          --defaults \
+          organization="$(ADO_ORG_URL)" \
+          project="$(ADO_PROJECT)"
+
+        echo "Waiting for ARM64 IP..."
+
+        for i in {1..30}
+        do
+
+          ARM64_IP=$(az pipelines variable-group variable list \
+            --group-id $(VARIABLE_GROUP_ID) \
+            --output json \
+            | jq -r --arg v "$VAR_NAME" '.[$v].value // empty')
+
+          if [ -n "$ARM64_IP" ]; then
+
+            echo "ARM64 IP Found: $ARM64_IP"
+
+            echo "##vso[task.setvariable variable=arm64_vm_private_ip]$ARM64_IP"
+
+            exit 0
+
+          fi
+
+          echo "Waiting..."
+          sleep 10
+
+        done
+
+        echo "ARM64 IP not found within 5 minutes"
+        exit 1
+
+      env:
+        AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+      displayName: Wait For ARM64 IP
+
+    #################################################
+    # Get Current AMD64 VM IP
+    #################################################
+
+    - bash: |
+
+        AMD64_IP=$(hostname -I | awk '{print $1}')
+
+        if [ -z "$AMD64_IP" ]; then
+          echo "AMD64 IP not found"
+          exit 1
+        fi
+
+        echo "AMD64 IP: $AMD64_IP"
+
+        echo "##vso[task.setvariable variable=amd64_vm_private_ip]$AMD64_IP"
+
+      displayName: Get AMD64 VM IP
 
     #################################################
     # Repository Selection
@@ -74,229 +278,131 @@ stages:
       displayName: Set Docker Repository
 
     #################################################
-    # Azure Login
-    #################################################
-
-    - bash: |
-        echo "Installing Azure CLI..."
-        apt-get update
-        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-        echo "Azure Login..."
-        az login --service-principal \
-          -u $(AZURE_CLIENT_ID) \
-          -p $(AZURE_CLIENT_SECRET) \
-          --tenant $(AZURE_TENANT_ID)
-
-        az account set \
-          --subscription $(AZURE_SUBSCRIPTION_ID)
-
-      displayName: Azure Login
-      condition: eq('${{ parameters.buildType }}', 'selfhost')
-
-    #################################################
-    # VM Start Logic
-    #################################################
-
-    - bash: |
-
-        STARTED=false
-
-        AMD_STATE=$(az vm get-instance-view \
-          -g $(RESOURCE_GROUP_NAME) \
-          -n $(AMD64_VM_NAME) \
-          --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" \
-          -o tsv)
-
-        ARM_STATE=$(az vm get-instance-view \
-          -g $(RESOURCE_GROUP_NAME) \
-          -n $(ARM64_VM_NAME) \
-          --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" \
-          -o tsv)
-
-        echo "AMD64 VM: $AMD_STATE"
-        echo "ARM64 VM: $ARM_STATE"
-
-        if [ "$AMD_STATE" != "VM running" ]; then
-          echo "Starting AMD64 VM"
-          az vm start -g $(RESOURCE_GROUP_NAME) -n $(AMD64_VM_NAME)
-          STARTED=true
-        fi
-
-        if [ "$ARM_STATE" != "VM running" ]; then
-          echo "Starting ARM64 VM"
-          az vm start -g $(RESOURCE_GROUP_NAME) -n $(ARM64_VM_NAME)
-          STARTED=true
-        fi
-
-        echo "##vso[task.setvariable variable=PIPELINE_STARTED_VM]$STARTED"
-
-      displayName: Start Buildx VMs
-      condition: eq('${{ parameters.buildType }}', 'selfhost')
-
-    #################################################
-    # Wait for VMs
-    #################################################
-
-    - bash: |
-        ATTEMPTS=30
-
-        for i in $(seq 1 $ATTEMPTS)
-        do
-
-          AMD=$(az vm get-instance-view \
-            -g $(RESOURCE_GROUP_NAME) \
-            -n $(AMD64_VM_NAME) \
-            --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" \
-            -o tsv)
-
-          ARM=$(az vm get-instance-view \
-            -g $(RESOURCE_GROUP_NAME) \
-            -n $(ARM64_VM_NAME) \
-            --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" \
-            -o tsv)
-
-          echo "Attempt $i"
-          echo "AMD64 = $AMD"
-          echo "ARM64 = $ARM"
-
-          if [ "$AMD" = "VM running" ] && [ "$ARM" = "VM running" ]; then
-            echo "Both VMs are running"
-            exit 0
-          fi
-
-          sleep 10
-        done
-
-        echo "VM startup timeout (5 minutes)"
-        exit 1
-
-      displayName: Wait For VMs
-      condition: eq('${{ parameters.buildType }}', 'selfhost')
-
-    #################################################
     # Download Package
     #################################################
 
     - bash: |
-        sudo apt-get update
-        sudo apt-get install ca-certificates curl zip -y
-        wget ${{ parameters.boldbiPackage }}
+
+        wget "${{ parameters.boldbiPackage }}"
+
         unzip BoldBI*.zip
+
         cd BoldBIServer-Linux
+
         wget https://raw.githubusercontent.com/mohamedasme-sf4303/temp-code/refs/heads/main/boldbi-manifets.txt
+        rm entrypoint.sh
+        wget https://raw.githubusercontent.com/mohamedasme-sf4303/temp-code/refs/heads/main/entrypoint.sh
         ls
 
       displayName: Download Package
-
-    #################################################
-    # Docker Install
-    #################################################
-
-    - bash: |
-
-        sudo apt-get update
-        sudo apt-get install ca-certificates curl -y
-        sudo install -m 0755 -d /etc/apt/keyrings
-        sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-        sudo chmod a+r /etc/apt/keyrings/docker.asc
-        # Add the repository to Apt sources:
-        echo \
-          "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-          $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-          sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        sudo apt-get update
-        sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
-        ARCH=amd64
-        BUILDX_URL=$(curl -s https://raw.githubusercontent.com/docker/actions-toolkit/main/.github/buildx-lab-releases.json | jq -r ".latest.assets[] | select(endswith(\"linux-$ARCH\"))")
-        # Download docker buildx with Build Cloud support
-        mkdir -vp ~/.docker/cli-plugins/
-        curl --silent -L --output ~/.docker/cli-plugins/docker-buildx $BUILDX_URL
-        chmod a+x ~/.docker/cli-plugins/docker-buildx
-      displayName: Docker Install
 
     #################################################
     # Docker Login
     #################################################
 
     - bash: |
+
         echo "$(DOCKER_PASSWORD)" | docker login \
           -u "$(DOCKER_USERNAME)" \
           --password-stdin
+
       displayName: Docker Login
 
     #################################################
-    # Cloud Build
+    # Wait For ARM64 BuildKit
     #################################################
 
     - bash: |
 
-        IMAGE="$(REPOSITORY):${{ parameters.imageTag }}"
-        docker buildx create --use --driver cloud "syncfusion/boldbi-cloud"
-        cd BoldBIServer-Linux
+        echo "Waiting for ARM64 BuildKit..."
 
-        docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$IMAGE" \
-          -f boldbi-manifets.txt .
+        for i in {1..30}
+        do
 
-      displayName: Cloud Buildx
-      condition: eq('${{ parameters.buildType }}', 'cloud')
+          if nc -z $(arm64_vm_private_ip) 1234; then
+            echo "BuildKit reachable"
+            exit 0
+          fi
+
+          echo "Waiting BuildKit..."
+          sleep 10
+
+        done
+
+        echo "BuildKit not reachable"
+        exit 1
+
+      displayName: Wait For BuildKit
 
     #################################################
-    # Selfhost Build
+    # Buildx
     #################################################
 
     - bash: |
+
+        docker buildx rm boldbi-builder || true
+
+        echo "AMD64 IP : $(amd64_vm_private_ip)"
+        echo "ARM64 IP : $(arm64_vm_private_ip)"
 
         docker buildx create \
           --name boldbi-builder \
           --driver remote \
-          tcp://$(AMD64_BUILDX_IP):1234
+          tcp://$(amd64_vm_private_ip):1234
 
         docker buildx create \
           --append \
           --name boldbi-builder \
           --driver remote \
-          tcp://$(ARM64_BUILDX_IP):1234
+          tcp://$(arm64_vm_private_ip):1234
 
         docker buildx use boldbi-builder
 
         docker buildx inspect --bootstrap
 
-        IMAGE="$(REPOSITORY):${{ parameters.imageTag }}"
+        DEBIAN_IMAGE="$(REPOSITORY):${{ parameters.imageTag }}_$(Build.BuildId)"
+        EVAL_IMAGE="$(REPOSITORY):${{ parameters.imageTag }}_$(Build.BuildId)_eval"
+        IMAGES_TYPE="${{ parameters.imagesType }}"
 
         cd BoldBIServer-Linux
 
-        docker buildx build \
-          --builder boldbi-builder \
-          --platform linux/amd64,linux/arm64 \
-          -t "$IMAGE" \
-          -f boldbi-manifets.txt .
+        echo "================================="
+        echo "Images Type : $IMAGES_TYPE"
+        echo "================================="
 
-      displayName: Selfhost Buildx
-      condition: eq('${{ parameters.buildType }}', 'selfhost')
+        if [ "$IMAGES_TYPE" = "debian" ] || [ "$IMAGES_TYPE" = "both" ]; then
 
-    #################################################
-    # Stop VMs
-    #################################################
+          echo "================================="
+          echo "Building Debian Image : $DEBIAN_IMAGE"
+          echo "================================="
 
-    - bash: |
+          docker buildx build \
+            --builder boldbi-builder \
+            --platform linux/amd64,linux/arm64 \
+            -t "$DEBIAN_IMAGE" \
+            -f boldbi-manifets.txt \
+            --push .
 
-        if [ "$(PIPELINE_STARTED_VM)" != "true" ]; then
-          echo "VMs were already running. Skip stopping."
-          exit 0
+          echo "Debian Image Pushed Successfully"
+
         fi
 
-        echo "Stopping AMD64 VM"
-        az vm deallocate \
-           -g $(RESOURCE_GROUP_NAME) \
-           -n $(AMD64_VM_NAME)
+        if [ "$IMAGES_TYPE" = "eval" ] || [ "$IMAGES_TYPE" = "both" ]; then
 
-        echo "Stopping ARM64 VM"
-        az vm deallocate \
-           -g $(RESOURCE_GROUP_NAME) \
-           -n $(ARM64_VM_NAME)
+          echo "================================="
+          echo "Building Eval Image : $EVAL_IMAGE"
+          echo "================================="
 
-      condition: eq('${{ parameters.buildType }}', 'selfhost')
-      displayName: Stop VMs
+          docker buildx build \
+            --builder boldbi-builder \
+            --platform linux/amd64,linux/arm64 \
+            -t "$EVAL_IMAGE" \
+            --build-arg INSTALL_POSTGRES=true \
+            -f boldbi-manifets.txt \
+            --push .
+
+          echo "Eval Image Pushed Successfully"
+
+        fi
+
+      displayName: Selfhost Buildx
