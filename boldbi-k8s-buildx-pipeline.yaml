@@ -1,87 +1,46 @@
 trigger: none
 
+variables:
+  ADO_ORG_URL: https://dev.azure.com/bold-bi
+  ADO_PROJECT: build
+  VARIABLE_GROUP_ID: 70
+
 parameters:
 
-  - name: imageTag
-    displayName: Docker Image Tag
-    type: string
-    default: latest
+- name: imageTag
+  displayName: Docker Image Tag
+  type: string
+  default: latest
 
-  - name: boldbiPackage
-    displayName: BoldBI Package
-    type: string
-    default: https://s3.amazonaws.com/files2.syncfusion.com/Installs/BoldBI/07-08-2026/BoldBIServer_Linux_Docker_16.2.5_08072026_091439.zip
+- name: boldbiPackage
+  displayName: BoldBI Package
+  type: string
+  default: https://s3.amazonaws.com/files2.syncfusion.com/Installs/BoldBI/07-08-2026/BoldBIServer_Linux_Docker_16.2.5_08072026_091439.zip
 
-  - name: buildType
-    displayName: Build Type
-    type: string
-    default: cloud
-    values:
-      - cloud
-      - selfhost
-
-  - name: environment
-    displayName: Environment
-    type: string
-    default: dev
-    values:
-      - dev
-      - production
-
-  - name: github_branch
-    displayName: BoldBI CI BranchName
-    type: string
-    default: development
-
-  - name: All
-    displayName: Build All Images
-    type: boolean
-    default: false
-  - name: id_web
-    displayName: Build id_web (Identity)
-    type: boolean
-    default: false
-  - name: id_api
-    displayName: Build id_api
-    type: boolean
-    default: false
-  - name: id_ums
-    displayName: Build id_ums
-    type: boolean
-    default: false
-  - name: bi_designer
-    displayName: Build BI Designer
-    type: boolean
-    default: false
-  - name: bi_web
-    displayName: Build BI Web
-    type: boolean
-    default: false
-  - name: bi_api
-    displayName: Build BI API
-    type: boolean
-    default: false
-  - name: bi_jobs
-    displayName: Build BI Jobs
-    type: boolean
-    default: false
-  - name: bold_etl
-    displayName: Build Bold ETL
-    type: boolean
-    default: false
-  - name: bold_ai
-    displayName: Build Bold AI
-    type: boolean
-    default: false
+- name: environment
+  displayName: Environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - production
 
 stages:
 
 - stage: Build
+
   jobs:
 
-  - job: DockerBuild
+  ####################################################################
+  # ARM64 JOB
+  ####################################################################
+
+  - job: Arm64Job
+
+    displayName: ARM64 IP + Wait For Image
+
     pool:
-      name: boldbi-self-host-build-testing-agent
+      name: boldbi-buildx-arm64-vmss-agent-pool
 
     steps:
 
@@ -90,7 +49,8 @@ stages:
     #################################################
 
     - bash: |
-        TAG="${{ parameters.imageTag }}"
+
+        TAG="${{ parameters.imageTag }}_$(Build.BuildId)"
 
         if [[ ! "$TAG" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$ ]]; then
           echo "Invalid Docker image tag: $TAG"
@@ -98,7 +58,193 @@ stages:
         fi
 
         echo "Image tag validation successful"
-      displayName: Validate image tag
+
+      displayName: Validate Tag
+
+    #################################################
+    # Save ARM64 IP
+    #################################################
+
+    - bash: |
+
+        ARM64_IP=$(hostname -I | awk '{print $1}')
+
+        if [ -z "$ARM64_IP" ]; then
+          echo "ARM64 IP not found"
+          exit 1
+        fi
+
+        VAR_NAME="ARM64_IP_$(Build.BuildId)"
+
+        echo "Saving Variable: $VAR_NAME"
+        echo "ARM64 IP: $ARM64_IP"
+
+        az extension add --name azure-devops --yes
+
+        az pipelines variable-group variable create \
+        --organization "$(ADO_ORG_URL)" \
+        --project "$(ADO_PROJECT)" \
+        --group-id $(VARIABLE_GROUP_ID) \
+        --name "$VAR_NAME" \
+        --value "$ARM64_IP"
+        echo "ARM64 IP stored"
+
+      env:
+        AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+      displayName: Save ARM64 IP
+
+    #################################################
+    # Verify Multi-Arch Images
+    #################################################
+
+    - bash: |
+
+        if [ "${{ parameters.environment }}" = "dev" ]; then
+          REPO="syncfusion/dev-boldbi-docker"
+        else
+          REPO="syncfusion/boldbi"
+        fi
+
+        TAG="${{ parameters.imageTag }}_$(Build.BuildId)"
+
+        IMAGE_DEBIAN="${REPO}:${TAG}"
+        IMAGE_EVAL="${REPO}:${TAG}_eval"
+
+        echo "$(DOCKER_PASSWORD)" | docker login \
+          -u "$(DOCKER_USERNAME)" \
+          --password-stdin
+
+        check_image() {
+
+          local IMAGE="$1"
+          local LABEL="$2"
+
+          for i in {1..30}
+          do
+
+            echo "[$LABEL] Attempt $i/30 : $IMAGE"
+
+            OUTPUT=$(docker buildx imagetools inspect "$IMAGE" 2>/dev/null)
+
+            AMD64_FOUND=$(echo "$OUTPUT" | grep -c "linux/amd64")
+            ARM64_FOUND=$(echo "$OUTPUT" | grep -c "linux/arm64")
+
+            echo "[$LABEL] amd64 count : $AMD64_FOUND"
+            echo "[$LABEL] arm64 count : $ARM64_FOUND"
+
+            if [ "$AMD64_FOUND" -gt 0 ] && [ "$ARM64_FOUND" -gt 0 ]; then
+              echo "[$LABEL] Multi-Arch Image Found : $IMAGE"
+              return 0
+            fi
+
+            echo "[$LABEL] Required architectures not available yet..."
+            sleep 60
+
+          done
+
+          echo "[$LABEL] ERROR: Multi-Arch Image Not Found : $IMAGE"
+          return 1
+
+        }
+
+        echo "================================="
+        echo "Waiting for images:"
+        echo " - $IMAGE_DEBIAN"
+        echo " - $IMAGE_EVAL"
+        echo "Architectures:"
+        echo " - linux/amd64"
+        echo " - linux/arm64"
+        echo "================================="
+
+        check_image "$IMAGE_DEBIAN" "DEBIAN"
+        check_image "$IMAGE_EVAL" "EVAL"
+
+        echo ""
+        echo "================================="
+        echo "SUCCESS: Both Multi-Arch Images Found"
+        echo " - $IMAGE_DEBIAN : linux/amd64 OK, linux/arm64 OK"
+        echo " - $IMAGE_EVAL  : linux/amd64 OK, linux/arm64 OK"
+        echo "================================="
+
+      displayName: Wait For Images
+
+  ####################################################################
+  # AMD64 JOB
+  ####################################################################
+
+  - job: DockerBuild
+
+    displayName: Build Docker Image
+
+    pool:
+      name: boldbi-buildx-amd64-vmss-agent-pool
+
+    steps:
+
+    #################################################
+    # Wait for ARM64 IP
+    #################################################
+
+    - bash: |
+
+        VAR_NAME="ARM64_IP_$(Build.BuildId)"
+        az devops configure \
+          --defaults \
+          organization="$(ADO_ORG_URL)" \
+          project="$(ADO_PROJECT)"
+
+        echo "Waiting for ARM64 IP..."
+
+        for i in {1..30}
+        do
+
+          ARM64_IP=$(az pipelines variable-group variable list \
+            --group-id $(VARIABLE_GROUP_ID) \
+            --output json \
+            | jq -r --arg v "$VAR_NAME" '.[$v].value // empty')
+
+          if [ -n "$ARM64_IP" ]; then
+
+            echo "ARM64 IP Found: $ARM64_IP"
+
+            echo "##vso[task.setvariable variable=arm64_vm_private_ip]$ARM64_IP"
+
+            exit 0
+
+          fi
+
+          echo "Waiting..."
+          sleep 10
+
+        done
+
+        echo "ARM64 IP not found within 5 minutes"
+        exit 1
+
+      env:
+        AZURE_DEVOPS_EXT_PAT: $(System.AccessToken)
+
+      displayName: Wait For ARM64 IP
+
+    #################################################
+    # Get Current AMD64 VM IP
+    #################################################
+
+    - bash: |
+
+        AMD64_IP=$(hostname -I | awk '{print $1}')
+
+        if [ -z "$AMD64_IP" ]; then
+          echo "AMD64 IP not found"
+          exit 1
+        fi
+
+        echo "AMD64 IP: $AMD64_IP"
+
+        echo "##vso[task.setvariable variable=amd64_vm_private_ip]$AMD64_IP"
+
+      displayName: Get AMD64 VM IP
 
     #################################################
     # Repository Selection
@@ -107,9 +253,9 @@ stages:
     - bash: |
 
         if [ "${{ parameters.environment }}" = "dev" ]; then
-          REPO="syncfusion/dev-bold"
+          REPO="syncfusion/dev-boldbi-docker"
         else
-          REPO="syncfusion/bold"
+          REPO="syncfusion/boldbi"
         fi
 
         echo "##vso[task.setvariable variable=REPOSITORY]$REPO"
@@ -117,559 +263,124 @@ stages:
       displayName: Set Docker Repository
 
     #################################################
-    # Azure Login
-    #################################################
-
-    - bash: |
-        echo "Installing Azure CLI..."
-        apt-get update
-        curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-        echo "Azure Login..."
-        az login --service-principal \
-          -u $(AZURE_CLIENT_ID) \
-          -p $(AZURE_CLIENT_SECRET) \
-          --tenant $(AZURE_TENANT_ID)
-
-        az account set \
-          --subscription $(AZURE_SUBSCRIPTION_ID)
-
-      displayName: Azure Login
-      condition: eq('${{ parameters.buildType }}', 'selfhost')
-
-    #################################################
-    # VM Start Logic
-    #################################################
-
-    - bash: |
-
-        STARTED=false
-
-        AMD_STATE=$(az vm get-instance-view \
-          -g $(RESOURCE_GROUP_NAME) \
-          -n $(AMD64_VM_NAME) \
-          --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" \
-          -o tsv)
-
-        ARM_STATE=$(az vm get-instance-view \
-          -g $(RESOURCE_GROUP_NAME) \
-          -n $(ARM64_VM_NAME) \
-          --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" \
-          -o tsv)
-
-        echo "AMD64 VM: $AMD_STATE"
-        echo "ARM64 VM: $ARM_STATE"
-
-        if [ "$AMD_STATE" != "VM running" ]; then
-          echo "Starting AMD64 VM"
-          az vm start -g $(RESOURCE_GROUP_NAME) -n $(AMD64_VM_NAME)
-          STARTED=true
-        fi
-
-        if [ "$ARM_STATE" != "VM running" ]; then
-          echo "Starting ARM64 VM"
-          az vm start -g $(RESOURCE_GROUP_NAME) -n $(ARM64_VM_NAME)
-          STARTED=true
-        fi
-
-        echo "##vso[task.setvariable variable=PIPELINE_STARTED_VM]$STARTED"
-
-      displayName: Start Buildx VMs
-      condition: eq('${{ parameters.buildType }}', 'selfhost')
-
-    #################################################
-    # Wait for VMs
-    #################################################
-
-    - bash: |
-        ATTEMPTS=30
-
-        for i in $(seq 1 $ATTEMPTS)
-        do
-
-          AMD=$(az vm get-instance-view \
-            -g $(RESOURCE_GROUP_NAME) \
-            -n $(AMD64_VM_NAME) \
-            --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" \
-            -o tsv)
-
-          ARM=$(az vm get-instance-view \
-            -g $(RESOURCE_GROUP_NAME) \
-            -n $(ARM64_VM_NAME) \
-            --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" \
-            -o tsv)
-
-          echo "Attempt $i"
-          echo "AMD64 = $AMD"
-          echo "ARM64 = $ARM"
-
-          if [ "$AMD" = "VM running" ] && [ "$ARM" = "VM running" ]; then
-            echo "Both VMs are running"
-            exit 0
-          fi
-
-          sleep 10
-        done
-
-        echo "VM startup timeout (5 minutes)"
-        exit 1
-
-      displayName: Wait For VMs
-      condition: eq('${{ parameters.buildType }}', 'selfhost')
-
-    #################################################
     # Download Package
     #################################################
 
-    - task: Syncfusion Gitea Checkout@1
-      inputs:
-        giteaUrl: 'https://gitea.syncfusion.com/bold-bi/boldbi-ci'
-        branch: '${{ parameters.github_branch }}'
-      displayName: 'Checkout boldbi-ci'
-
-    - script: |
-        ls -la
-        mkdir -p boldbi-ci
-        shopt -s extglob
-        cp -r !(boldbi-ci) boldbi-ci/
-      displayName: 'Organize files into boldbi-ci'
-
-    - task: Bash@3
-      inputs:
-        targetType: 'inline'
-        script: |
-          sudo wget "${{ parameters.boldbiPackage }}"
-          sudo apt install -y unzip
-          sudo unzip BoldBI*.zip
-          WORK_DIR="$(System.DefaultWorkingDirectory)"
-          if [ -d "$WORK_DIR/BoldBIServer-Linux" ]; then
-              TARGET_DIR="$WORK_DIR/BoldBIServer-Linux"
-              echo "##vso[task.setvariable variable=extractPath]$TARGET_DIR"
-
-          elif [ -d "$WORK_DIR/BoldBIEnterpriseEdition-Linux" ]; then
-              TARGET_DIR="$WORK_DIR/BoldBIEnterpriseEdition-Linux"
-              echo "##vso[task.setvariable variable=extractPath]$TARGET_DIR"
-
-          else
-              echo "ERROR: Extracted package folder not found."
-              exit 1
-          fi
-
-          if [ -z "${{ parameters.imageTag }}" ]; then
-            IMAGE_TAG=$(echo "${{ parameters.boldbiPackage }}" | grep -oP 'Linux_\K[\d\.]+_\d{8}_\d{6}')
-          else
-            IMAGE_TAG="${{ parameters.imageTag }}"
-          fi
-          echo "##vso[task.setvariable variable=TAG]$IMAGE_TAG"
-          echo "Using TAG: $IMAGE_TAG"
-
-          sudo rm -f BoldBI*.zip
-
-          sudo mkdir -p $TARGET_DIR/application/idp/web/appdatafiles
-
-          sudo cp -r $TARGET_DIR/application/utilities/installutils \
-                     $TARGET_DIR/application/idp/web/appdatafiles/installutils
-          sudo cp -r $TARGET_DIR/application/utilities/installutils \
-                     $TARGET_DIR/application/idp/api/appdatafiles/installutils
-          sudo cp -r $TARGET_DIR/application/utilities/installutils \
-                     $TARGET_DIR/application/idp/ums/appdatafiles/installutils          
-
-          sudo cp -r $WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/shell_scripts/id_web/* \
-                     $TARGET_DIR/application/idp/web/
-          sudo cp -r $WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/shell_scripts/id_ums/* \
-                     $TARGET_DIR/application/idp/ums/
-          sudo cp -r $WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/shell_scripts/id_api/* \
-                     $TARGET_DIR/application/idp/api/
-          sudo cp -r $WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/shell_scripts/designer/* \
-                     $TARGET_DIR/application/bi/dataservice/
-          sudo cp -r $WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/shell_scripts/bi_api/* \
-                     $TARGET_DIR/application/bi/api/
-          sudo cp -r $WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/shell_scripts/bi_jobs/* \
-                     $TARGET_DIR/application/bi/jobs/
-          sudo cp -r $WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/shell_scripts/bi_web/* \
-                     $TARGET_DIR/application/bi/web/
-          sudo cp -r $WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/shell_scripts/bold_ai/* \
-                     $TARGET_DIR/application/ai/aiservice/
-          sudo cp -r $WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/shell_scripts/bold_etl/* \
-                     $TARGET_DIR/application/etl/etlservice/
-          sudo cp $TARGET_DIR/application/app_data/configuration/product.json \
-                     $TARGET_DIR/application/idp/api/
-          sudo cp $TARGET_DIR/application/app_data/configuration/product.json \
-                     $TARGET_DIR/application/idp/ums/
-
-          sudo cp -r $TARGET_DIR/application/app_data/* \
-                     $TARGET_DIR/application/idp/web/appdatafiles/installutils/app_data/
-
-          sudo unzip -o $TARGET_DIR/clientlibrary/clientlibrary.zip \
-                     -d $TARGET_DIR/application/bi/dataservice/optional-libs
-
-          # sudo mkdir -p $TARGET_DIR/application/bi/dataservice/puppeteer/Linux-901912
-          sudo ls $TARGET_DIR/application/
-          sudo ls $TARGET_DIR/application/bi/dataservice/puppeteer/Chrome
-          # sudo rm $TARGET_DIR/application/chrome-linux.zip
-          # sudo wget https://sendit.sh/cM3v6/r9jfw.zip
-          # sudo ls
-          # sudo mv r9jfw.zip chrome-linux.zip
-          # sudo ls
-          # sudo cp chrome-linux.zip $TARGET_DIR/application/
-          # sudo ls $TARGET_DIR/application/
-          # sudo unzip -o $TARGET_DIR/application/bi/dataservice/puppeteer/Chrome/chrome-linux64.zip \
-          #            -d $TARGET_DIR/application/bi/dataservice/puppeteer/Chrome
-          # sudo mv $TARGET_DIR/application/bi/dataservice/puppeteer/Chrome/chrome-linux64/* \
-          #             $TARGET_DIR/application/bi/dataservice/puppeteer/Chrome/
-          # sudo chmod -R 777 $TARGET_DIR/application/bi/dataservice/puppeteer/Chrome/
-          # sudo rm -rf $TARGET_DIR/application/bi/dataservice/puppeteer/Chrome/chrome-linux64
-          # sudo rm -rf $TARGET_DIR/application/bi/dataservice/puppeteer/Chrome/chrome-linux64.zip
-          
-          sudo ls $TARGET_DIR/application/bi/dataservice/puppeteer/Chrome
-
-          destDir="$TARGET_DIR/"
-          ubuntuDir="$WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/dockerfiles/debian/"
-          arm64Dir="$WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/dockerfiles/debian-arm64/"
-          manifestDir="$WORK_DIR/boldbi-ci/installscripts/jenkins-ci/kubernetes/dockerfiles/mainfest/"
-          for txtFile in "$arm64Dir"*.txt; do
-            [ -f "$txtFile" ] || continue
-            filename=$(basename "$txtFile")
-            imageName=$(echo "$filename" | sed 's/^[^-]*-//' | sed 's/\.txt$//')
-            sudo cp "$txtFile" "$destDir/${imageName}.Dockerfile"
-          done
-
-          for txtFile in "$ubuntuDir"*.txt; do
-            [ -f "$txtFile" ] || continue
-            filename=$(basename "$txtFile")
-            imageName=$(echo "$filename" | sed 's/^[^-]*-//' | sed 's/\.txt$//')
-            sudo cp "$txtFile" "$destDir/${imageName}-amd64.Dockerfile"
-          done
-
-          for txtFile in "$manifestDir"*.txt; do
-            [ -f "$txtFile" ] || continue
-            filename=$(basename "$txtFile")
-            imageName=$(echo "$filename" | sed 's/^[^-]*-//' | sed 's/\.txt$//')
-            sudo cp "$txtFile" "$destDir/${imageName}-manifest.Dockerfile"
-          done
-
-          echo "Prepared Dockerfiles:"
-          sudo ls -la "$destDir"/*.Dockerfile
-      displayName: 'Prepare Application and Dockerfiles'
-
-
-    #################################################
-    # Docker Install
-    #################################################
-
     - bash: |
 
-        sudo apt-get update
-        sudo apt-get install ca-certificates curl -y
-        sudo install -m 0755 -d /etc/apt/keyrings
-        sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-        sudo chmod a+r /etc/apt/keyrings/docker.asc
-        # Add the repository to Apt sources:
-        echo \
-          "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-          $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-          sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        sudo apt-get update
-        sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
-        ARCH=amd64
-        BUILDX_URL=$(curl -s https://raw.githubusercontent.com/docker/actions-toolkit/main/.github/buildx-lab-releases.json | jq -r ".latest.assets[] | select(endswith(\"linux-$ARCH\"))")
-        # Download docker buildx with Build Cloud support
-        mkdir -vp ~/.docker/cli-plugins/
-        curl --silent -L --output ~/.docker/cli-plugins/docker-buildx $BUILDX_URL
-        chmod a+x ~/.docker/cli-plugins/docker-buildx
-      displayName: Docker Install
+        wget "${{ parameters.boldbiPackage }}"
+
+        unzip BoldBI*.zip
+
+        cd BoldBIServer-Linux
+
+        wget https://raw.githubusercontent.com/mohamedasme-sf4303/temp-code/refs/heads/main/boldbi-manifets.txt
+        rm entrypoint.sh
+        wget https://raw.githubusercontent.com/mohamedasme-sf4303/temp-code/refs/heads/main/entrypoint.sh
+        ls
+
+      displayName: Download Package
 
     #################################################
     # Docker Login
     #################################################
 
     - bash: |
+
         echo "$(DOCKER_PASSWORD)" | docker login \
           -u "$(DOCKER_USERNAME)" \
           --password-stdin
+
       displayName: Docker Login
 
     #################################################
-    # Cloud Build
+    # Wait For ARM64 BuildKit
     #################################################
 
     - bash: |
-        IDP_WEB_IMAGE="$(REPOSITORY)-identity:${{ parameters.imageTag }}"
-        docker buildx create --use --driver cloud "syncfusion/boldbi-cloud"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$IDP_WEB_IMAGE" \
-          -f identity-manifest.Dockerfile .
-      displayName: Build Identity Web
-      condition: and(eq('${{ parameters.buildType }}', 'cloud'), or(eq('${{ parameters.id_web }}', true), eq('${{ parameters.All }}', true)))
-      
-    - bash: |
-        IDP_API_IMAGE="$(REPOSITORY)-identity-api:${{ parameters.imageTag }}"
-        docker buildx create --use --driver cloud "syncfusion/boldbi-cloud"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$IDP_API_IMAGE" \
-          -f identity-api-manifest.Dockerfile .
-      displayName: Build Identity API
-      condition: and(eq('${{ parameters.buildType }}', 'cloud'), or(eq('${{ parameters.id_api }}', true), eq('${{ parameters.All }}', true)))
 
-    - bash: |
-        IDP_UMS_IMAGE="$(REPOSITORY)-ums:${{ parameters.imageTag }}"
-        docker buildx create --use --driver cloud "syncfusion/boldbi-cloud"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$IDP_UMS_IMAGE" \
-          -f ums-manifest.Dockerfile .
-      displayName: Build UMS
-      condition: and(eq('${{ parameters.buildType }}', 'cloud'), or(eq('${{ parameters.id_ums }}', true), eq('${{ parameters.All }}', true)))
+        echo "Waiting for ARM64 BuildKit..."
 
-    - bash: |
-        BI_WEB_IMAGE="$(REPOSITORY)bi-server:${{ parameters.imageTag }}"
-        docker buildx create --use --driver cloud "syncfusion/boldbi-cloud"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_WEB_IMAGE" \
-          -f server-manifest.Dockerfile .
-      displayName: Build BI Server
-      condition: and(eq('${{ parameters.buildType }}', 'cloud'), or(eq('${{ parameters.bi_web }}', true), eq('${{ parameters.All }}', true)))
+        for i in {1..30}
+        do
 
-    - bash: |
-        BI_API_IMAGE="$(REPOSITORY)bi-server-api:${{ parameters.imageTag }}"
-        docker buildx create --use --driver cloud "syncfusion/boldbi-cloud"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_API_IMAGE" \
-          -f server-api-manifest.Dockerfile .
-      displayName: Build BI Server API
-      condition: and(eq('${{ parameters.buildType }}', 'cloud'), or(eq('${{ parameters.bi_api }}', true), eq('${{ parameters.All }}', true)))
+          if nc -z $(arm64_vm_private_ip) 1234; then
+            echo "BuildKit reachable"
+            exit 0
+          fi
 
-    - bash: |
-        BI_JOBS_IMAGE="$(REPOSITORY)bi-server-jobs:${{ parameters.imageTag }}"
-        docker buildx create --use --driver cloud "syncfusion/boldbi-cloud"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_JOBS_IMAGE" \
-          -f server-jobs-manifest.Dockerfile .
-      displayName: Build BI Jobs
-      condition: and(eq('${{ parameters.buildType }}', 'cloud'), or(eq('${{ parameters.bi_jobs }}', true), eq('${{ parameters.All }}', true)))
+          echo "Waiting BuildKit..."
+          sleep 10
 
-    - bash: |
-        BI_DESIGNER_IMAGE="$(REPOSITORY)bi-designer:${{ parameters.imageTag }}"
-        docker buildx create --use --driver cloud "syncfusion/boldbi-cloud"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_DESIGNER_IMAGE" \
-          -f designer-manifest.Dockerfile .
-      displayName: Build BI Designer
-      condition: and(eq('${{ parameters.buildType }}', 'cloud'), or(eq('${{ parameters.bi_designer }}', true), eq('${{ parameters.All }}', true)))
+        done
 
-    - bash: |
-        BI_ETL_IMAGE="$(REPOSITORY)-etl:${{ parameters.imageTag }}"
-        docker buildx create --use --driver cloud "syncfusion/boldbi-cloud"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_ETL_IMAGE" \
-          -f etl-manifest.Dockerfile .
-      displayName: Build ETL
-      condition: and(eq('${{ parameters.buildType }}', 'cloud'), or(eq('${{ parameters.bold_etl }}', true), eq('${{ parameters.All }}', true)))
+        echo "BuildKit not reachable"
+        exit 1
 
-    - bash: |
-        BI_AI_IMAGE="$(REPOSITORY)-ai:${{ parameters.imageTag }}"
-        docker buildx create --use --driver cloud "syncfusion/boldbi-cloud"
-        cd BoldBIServer-Linux
-
-        docker buildx build \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_AI_IMAGE" \
-          -f ai-manifest.Dockerfile .
-      displayName: Build AI
-      condition: and(eq('${{ parameters.buildType }}', 'cloud'), or(eq('${{ parameters.bold_ai }}', true), eq('${{ parameters.All }}', true)))
+      displayName: Wait For BuildKit
 
     #################################################
-    # Selfhost Build
+    # Buildx - Build Both Images
     #################################################
 
     - bash: |
+
+        docker buildx rm boldbi-builder || true
+
+        echo "AMD64 IP : $(amd64_vm_private_ip)"
+        echo "ARM64 IP : $(arm64_vm_private_ip)"
+
         docker buildx create \
           --name boldbi-builder \
           --driver remote \
-          tcp://$(AMD64_BUILDX_IP):1234
-    
+          tcp://$(amd64_vm_private_ip):1234
+
         docker buildx create \
           --append \
           --name boldbi-builder \
           --driver remote \
-          tcp://$(ARM64_BUILDX_IP):1234
-    
+          tcp://$(arm64_vm_private_ip):1234
+
         docker buildx use boldbi-builder
+
         docker buildx inspect --bootstrap
-        docker buildx prune -af || true
-        docker buildx use boldbi-builder
-        docker buildx inspect --bootstrap
-      displayName: Initialize Buildx Builder
-      condition: eq('${{ parameters.buildType }}', 'selfhost')
 
-    - bash: |
-        IDP_WEB_IMAGE="$(REPOSITORY)-identity:${{ parameters.imageTag }}"
+        DEBIAN_IMAGE="$(REPOSITORY):${{ parameters.imageTag }}_$(Build.BuildId)"
+        EVAL_IMAGE="$(REPOSITORY):${{ parameters.imageTag }}_$(Build.BuildId)_eval"
+
         cd BoldBIServer-Linux
-    
+
+        echo "================================="
+        echo "Building Debian Image"
+        echo "Image: $DEBIAN_IMAGE"
+        echo "================================="
+
         docker buildx build \
           --builder boldbi-builder \
           --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$IDP_WEB_IMAGE" \
-          -f identity-manifest.Dockerfile .
-      displayName: Build Identity Web
-      condition: and(eq('${{ parameters.buildType }}', 'selfhost'), or(eq('${{ parameters.id_web }}', true), eq('${{ parameters.All }}', true)))
+          -t "$DEBIAN_IMAGE" \
+          -f boldbi-manifets.txt \
+          --push .
 
-    - bash: |
-        IDP_API_IMAGE="$(REPOSITORY)-identity-api:${{ parameters.imageTag }}"
-        cd BoldBIServer-Linux
-    
+        echo "================================="
+        echo "Debian Image Pushed Successfully"
+        echo "================================="
+
+        echo "================================="
+        echo "Building Eval Image"
+        echo "Image: $EVAL_IMAGE"
+        echo "================================="
+
         docker buildx build \
           --builder boldbi-builder \
           --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$IDP_API_IMAGE" \
-          -f identity-api-manifest.Dockerfile .
-      displayName: Build Identity API
-      condition: and(eq('${{ parameters.buildType }}', 'selfhost'), or(eq('${{ parameters.id_api }}', true), eq('${{ parameters.All }}', true)))
+          -t "$EVAL_IMAGE" \
+          --build-arg INSTALL_POSTGRES=true \
+          -f boldbi-manifets.txt \
+          --push .
 
-    - bash: |
-        IDP_UMS_IMAGE="$(REPOSITORY)-ums:${{ parameters.imageTag }}"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --builder boldbi-builder \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$IDP_UMS_IMAGE" \
-          -f ums-manifest.Dockerfile .
-      displayName: Build UMS
-      condition: and(eq('${{ parameters.buildType }}', 'selfhost'), or(eq('${{ parameters.id_ums }}', true), eq('${{ parameters.All }}', true)))
+        echo "================================="
+        echo "Eval Image Pushed Successfully"
+        echo "================================="
 
-    - bash: |
-        BI_WEB_IMAGE="$(REPOSITORY)bi-server:${{ parameters.imageTag }}"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --builder boldbi-builder \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_WEB_IMAGE" \
-          -f server-manifest.Dockerfile .
-      displayName: Build BI Server
-      condition: and(eq('${{ parameters.buildType }}', 'selfhost'), or(eq('${{ parameters.bi_web }}', true), eq('${{ parameters.All }}', true)))
-
-    - bash: |
-        BI_API_IMAGE="$(REPOSITORY)bi-server-api:${{ parameters.imageTag }}"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --builder boldbi-builder \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_API_IMAGE" \
-          -f server-api-manifest.Dockerfile .
-      displayName: Build BI Server API
-      condition: and(eq('${{ parameters.buildType }}', 'selfhost'), or(eq('${{ parameters.bi_api }}', true), eq('${{ parameters.All }}', true)))
-
-    - bash: |
-        BI_JOBS_IMAGE="$(REPOSITORY)bi-server-jobs:${{ parameters.imageTag }}"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --builder boldbi-builder \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_JOBS_IMAGE" \
-          -f server-jobs-manifest.Dockerfile .
-      displayName: Build BI Jobs
-      condition: and(eq('${{ parameters.buildType }}', 'selfhost'), or(eq('${{ parameters.bi_jobs }}', true), eq('${{ parameters.All }}', true)))
-
-    - bash: |
-        BI_DESIGNER_IMAGE="$(REPOSITORY)bi-designer:${{ parameters.imageTag }}"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --builder boldbi-builder \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_DESIGNER_IMAGE" \
-          -f designer-manifest.Dockerfile .
-      displayName: Build BI Designer
-      condition: and(eq('${{ parameters.buildType }}', 'selfhost'), or(eq('${{ parameters.bi_designer }}', true), eq('${{ parameters.All }}', true)))
-
-    - bash: |
-        BI_ETL_IMAGE="$(REPOSITORY)-etl:${{ parameters.imageTag }}"
-        cd BoldBIServer-Linux
-    
-        docker buildx build \
-          --builder boldbi-builder \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_ETL_IMAGE" \
-          -f etl-manifest.Dockerfile .
-      displayName: Build ETL
-      condition: and(eq('${{ parameters.buildType }}', 'selfhost'), or(eq('${{ parameters.bold_etl }}', true), eq('${{ parameters.All }}', true)))
-
-    - bash: |
-        BI_AI_IMAGE="$(REPOSITORY)-ai:${{ parameters.imageTag }}"
-        cd BoldBIServer-Linux
-        
-        docker buildx build \
-          --builder boldbi-builder \
-          --platform linux/amd64,linux/arm64 \
-          --push \
-          -t "$BI_AI_IMAGE" \
-          -f ai-manifest.Dockerfile .
-      displayName: Build AI
-      condition: and(eq('${{ parameters.buildType }}', 'selfhost'), or(eq('${{ parameters.bold_ai }}', true), eq('${{ parameters.All }}', true)))
-
-    #################################################
-    # Stop VMs
-    #################################################
-
-    - bash: |
-
-        if [ "$(PIPELINE_STARTED_VM)" != "true" ]; then
-          echo "VMs were already running. Skip stopping."
-          exit 0
-        fi
-
-        echo "Stopping AMD64 VM"
-        az vm deallocate \
-           -g $(RESOURCE_GROUP_NAME) \
-           -n $(AMD64_VM_NAME)
-
-        echo "Stopping ARM64 VM"
-        az vm deallocate \
-           -g $(RESOURCE_GROUP_NAME) \
-           -n $(ARM64_VM_NAME)
-
-      condition: eq('${{ parameters.buildType }}', 'selfhost')
-      displayName: Stop VMs
+      displayName: Selfhost Buildx
