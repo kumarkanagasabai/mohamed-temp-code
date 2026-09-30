@@ -115,7 +115,7 @@ stages:
           REPO="syncfusion/boldbi"
         fi
     
-        IMAGE="${REPO}:${{ parameters.imageTag }}_$(Build.BuildId)"
+        IMAGE="${REPO}:${{ parameters.imageTag }}_$(Build.BuildId)_eval"
     
         echo "$(DOCKER_PASSWORD)" | docker login \
           -u "$(DOCKER_USERNAME)" \
@@ -348,12 +348,12 @@ stages:
         EVAL_IMAGE="$(REPOSITORY):${{ parameters.imageTag }}_$(Build.BuildId)_eval"
         cd BoldBIServer-Linux
 
-        docker buildx build \
-          --builder boldbi-builder \
-          --platform linux/amd64,linux/arm64 \
-          -t "$DEBIAN_IMAGE" \
-          -f boldbi-manifets.txt \
-          --push .
+        # docker buildx build \
+        #   --builder boldbi-builder \
+        #   --platform linux/amd64,linux/arm64 \
+        #   -t "$DEBIAN_IMAGE" \
+        #   -f boldbi-manifets.txt \
+        #   --push .
 
         docker buildx build \
           --builder boldbi-builder \
