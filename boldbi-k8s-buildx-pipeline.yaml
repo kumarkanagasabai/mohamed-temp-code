@@ -412,6 +412,8 @@ stages:
           sudo rm -f BoldBI*.zip
 
           sudo mkdir -p $TARGET_DIR/application/idp/web/appdatafiles
+          sudo mkdir -p $TARGET_DIR/application/idp/api/appdatafiles
+          sudo mkdir -p $TARGET_DIR/application/idp/ums/appdatafiles
 
           sudo cp -r $TARGET_DIR/application/utilities/installutils \
                      $TARGET_DIR/application/idp/web/appdatafiles/installutils
